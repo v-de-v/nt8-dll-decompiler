@@ -1,0 +1,276 @@
+name: Build Android Debug APK
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install MAUI workloads
+        run: dotnet workload install maui android
+
+      - name: Create MAUI project
+        run: dotnet new maui -n Nt8DllDecompiler
+
+      - name: Apply custom code
+        run: |
+          # Overwrite project file
+          cat > Nt8DllDecompiler/Nt8DllDecompiler.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFrameworks>net8.0-android</TargetFrameworks>
+              <UseMaui>true</UseMaui>
+              <Nullable>enable</Nullable>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <ApplicationTitle>NT8 DLL Decompiler</ApplicationTitle>
+              <ApplicationId>com.example.nt8decompiler</ApplicationId>
+              <SupportedOSPlatformVersion>21</SupportedOSPlatformVersion>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="ICSharpCode.Decompiler" Version="9.1.0.7988" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          # Maui program
+          cat > Nt8DllDecompiler/MauiProgram.cs <<'EOF'
+          using Microsoft.Maui.Hosting;
+          using Microsoft.Extensions.DependencyInjection;
+
+          namespace Nt8DllDecompiler;
+
+          public static class MauiProgram
+          {
+              public static MauiApp CreateMauiApp()
+              {
+                  var builder = MauiApp.CreateBuilder()
+                      .UseMauiApp<App>();
+
+                  builder.Services.AddSingleton<DecompileService>();
+                  builder.Services.AddSingleton<MainPage>();
+
+                  return builder.Build();
+              }
+          }
+          EOF
+
+          # Application
+          cat > Nt8DllDecompiler/App.xaml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8" ?>
+          <Application xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+                       x:Class="Nt8DllDecompiler.App">
+            <Application.Resources/>
+          </Application>
+          EOF
+
+          cat > Nt8DllDecompiler/App.xaml.cs <<'EOF'
+          namespace Nt8DllDecompiler;
+
+          public partial class App : Application
+          {
+              public App(MainPage mainPage)
+              {
+                  InitializeComponent();
+                  MainPage = new NavigationPage(mainPage);
+              }
+          }
+          EOF
+
+          # Main page XAML
+          cat > Nt8DllDecompiler/MainPage.xaml <<'EOF'
+          <?xml version="1.0" encoding="utf-8" ?>
+          <ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+                       x:Class="Nt8DllDecompiler.MainPage"
+                       Title="NT8 DLL Decompiler">
+            <VerticalStackLayout Padding="16" Spacing="12">
+              <Button Text="Select .dll" Clicked="OnPickClicked" />
+              <Label x:Name="lblSelected" Text="No file selected." LineBreakMode="NoWrap"/>
+              <Button x:Name="btnDecompile" Text="Decompile & Export ZIP" IsEnabled="False" Clicked="OnDecompileClicked" />
+              <ActivityIndicator x:Name="spinner" IsVisible="False" IsRunning="False"/>
+              <Label Text="Preview:" FontAttributes="Bold"/>
+              <ScrollView HeightRequest="280">
+                <Editor x:Name="previewEditor" IsReadOnly="True" AutoSize="TextChanges" Placeholder="Decompiled code preview will appear here..."/>
+              </ScrollView>
+            </VerticalStackLayout>
+          </ContentPage>
+          EOF
+
+          # Main page code-behind
+          cat > Nt8DllDecompiler/MainPage.xaml.cs <<'EOF'
+          using Microsoft.Maui.Storage;
+          using Microsoft.Maui.Controls;
+          using Microsoft.Maui.ApplicationModel.DataTransfer;
+
+          namespace Nt8DllDecompiler;
+
+          public partial class MainPage : ContentPage
+          {
+              private readonly DecompileService _service;
+              private string? _localCopyPath;
+
+              public MainPage(DecompileService service)
+              {
+                  InitializeComponent();
+                  _service = service;
+              }
+
+              async void OnPickClicked(object sender, EventArgs e)
+              {
+                  try
+                  {
+                      var fileTypes = new FilePickerFileType(new Dictionary<DevicePlatform, IEnumerable<string>>
+                      {
+                          { DevicePlatform.Android, new[] { "application/octet-stream", "application/x-msdownload", ".dll" } }
+                      });
+
+                      var result = await FilePicker.PickAsync(new PickOptions
+                      {
+                          PickerTitle = "Select a NinjaTrader .dll",
+                          FileTypes = fileTypes
+                      });
+
+                      if (result == null) return;
+
+                      using var src = await result.OpenReadAsync();
+                      _localCopyPath = Path.Combine(FileSystem.CacheDirectory, result.FileName);
+                      using (var dst = File.Create(_localCopyPath))
+                          await src.CopyToAsync(dst);
+
+                      lblSelected.Text = result.FileName;
+                      btnDecompile.IsEnabled = true;
+
+                      spinner.IsVisible = spinner.IsRunning = true;
+                      var preview = await _service.PreviewAsync(_localCopyPath);
+                      const int maxPreview = 6000;
+                      previewEditor.Text = preview.Length > maxPreview
+                          ? preview[..maxPreview] + "\\n/* …truncated preview… */"
+                          : preview;
+                  }
+                  catch (Exception ex)
+                  {
+                      await DisplayAlert("Pick failed", ex.Message, "OK");
+                  }
+                  finally
+                  {
+                      spinner.IsVisible = spinner.IsRunning = false;
+                  }
+              }
+
+              async void OnDecompileClicked(object sender, EventArgs e)
+              {
+                  if (_localCopyPath is null) return;
+
+                  btnDecompile.IsEnabled = false;
+                  spinner.IsVisible = spinner.IsRunning = true;
+                  try
+                  {
+                      var zipPath = await _service.DecompileToZipAsync(_localCopyPath);
+                      await Share.Default.RequestAsync(new ShareFileRequest
+                      {
+                          Title = "Decompiled sources",
+                          File = new ShareFile(zipPath)
+                      });
+                  }
+                  catch (Exception ex)
+                  {
+                      await DisplayAlert("Decompile failed", ex.Message, "OK");
+                  }
+                  finally
+                  {
+                      spinner.IsVisible = spinner.IsRunning = false;
+                      btnDecompile.IsEnabled = true;
+                  }
+              }
+          }
+          EOF
+
+          # Decompile service
+          cat > Nt8DllDecompiler/DecompileService.cs <<'EOF'
+          using System.IO.Compression;
+          using ICSharpCode.Decompiler;
+          using ICSharpCode.Decompiler.CSharp;
+          using ICSharpCode.Decompiler.CSharp.Syntax;
+          using ICSharpCode.Decompiler.Metadata;
+          using ICSharpCode.Decompiler.TypeSystem;
+          using Microsoft.Maui.Storage;
+
+          namespace Nt8DllDecompiler;
+
+          public sealed class DecompileService
+          {
+              public async Task<string> PreviewAsync(string assemblyPath)
+              {
+                  var resolver = new UniversalAssemblyResolver(assemblyPath, throwOnError: false, targetFramework: null);
+                  var settings = new DecompilerSettings(LanguageVersion.Latest);
+                  var decompiler = new CSharpDecompiler(assemblyPath, resolver, settings);
+
+                  return await Task.Run(() => decompiler.DecompileWholeModuleAsString()).ConfigureAwait(false);
+              }
+
+              public async Task<string> DecompileToZipAsync(string assemblyPath)
+              {
+                  var resolver = new UniversalAssemblyResolver(assemblyPath, throwOnError: false, targetFramework: null);
+                  var settings = new DecompilerSettings(LanguageVersion.Latest);
+                  var decompiler = new CSharpDecompiler(assemblyPath, resolver, settings);
+
+                  var workDir = Path.Combine(FileSystem.CacheDirectory, "decompiled_" + Guid.NewGuid().ToString("N"));
+                  Directory.CreateDirectory(workDir);
+
+                  await Task.Run(() =>
+                  {
+                      var types = decompiler.TypeSystem.MainModule.TypeDefinitions;
+                      foreach (var t in types)
+                      {
+                          if (t.Name == "<Module>") continue;
+
+                          string code = decompiler.DecompileTypeAsString(t.FullTypeName);
+
+                          var nsPath = string.IsNullOrWhiteSpace(t.Namespace)
+                              ? workDir
+                              : Path.Combine(workDir, t.Namespace.Replace('.', Path.DirectorySeparatorChar));
+
+                          Directory.CreateDirectory(nsPath);
+
+                          var fileName = MakeSafeFileName(t.Name) + ".cs";
+                          File.WriteAllText(Path.Combine(nsPath, fileName), code);
+                      }
+
+                  }).ConfigureAwait(false);
+
+                  var zipPath = Path.Combine(FileSystem.CacheDirectory,
+                      $"decompiled-{Path.GetFileNameWithoutExtension(assemblyPath)}.zip");
+
+                  if (File.Exists(zipPath)) File.Delete(zipPath);
+                  ZipFile.CreateFromDirectory(workDir, zipPath, CompressionLevel.Fastest, includeBaseDirectory: false);
+
+                  return zipPath;
+              }
+
+              private static string MakeSafeFileName(string name)
+              {
+                  foreach (var c in Path.GetInvalidFileNameChars())
+                      name = name.Replace(c, '_');
+                  return name.Replace('`', '_').Replace('+', '.');
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: dotnet publish Nt8DllDecompiler/Nt8DllDecompiler.csproj -c Debug -f net8.0-android -p:AndroidPackageFormat=apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: nt8-dll-decompiler-apk
+          path: Nt8DllDecompiler/bin/Debug/net8.0-android/*.apk
